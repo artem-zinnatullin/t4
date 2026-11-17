@@ -1,0 +1,99 @@
+name: Publish Fork Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Existing branch in this fork to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-image-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish multi-platform image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out requested branch
+        uses: actions/checkout@v7
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          persist-credentials: false
+
+      - name: Record exact source commit
+        id: source
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=fork-${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (unit)
+        shell: bash
+        run: |
+          go test -short -timeout 360s -count=1 \
+            . \
+            ./cmd/t4 \
+            ./etcd \
+            ./etcd/auth \
+            ./internal/... \
+            ./pkg/object \
+            ./tests/compat
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp build date
+        id: stamp
+        shell: bash
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push tagged image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}:${{ steps.source.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+          build-args: |
+            VERSION=${{ steps.source.outputs.tag }}
+            COMMIT=${{ steps.source.outputs.sha }}
+            DATE=${{ steps.stamp.outputs.date }}
+
+      - name: Report published image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.source.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPO: ghcr.io/${{ github.repository }}
+        shell: bash
+        run: |
+          printf '### Published fork image\n\n%s\n\n%s@%s\n' \
+            "$IMAGE" "$REPO" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
