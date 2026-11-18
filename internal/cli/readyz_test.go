@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,7 +66,7 @@ func readyzStatus(t *testing.T, url string, want int) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +74,7 @@ func readyzStatus(t *testing.T, url string, want int) {
 	if resp.StatusCode != want {
 		t.Fatalf("GET %s = %d, want %d: %s", url, resp.StatusCode, want, body)
 	}
-	if want == http.StatusServiceUnavailable && url[len(url)-7:] == "/readyz" && string(body) != "not ready\n" {
+	if want == http.StatusServiceUnavailable && strings.HasSuffix(url, "/readyz") && string(body) != "not ready\n" {
 		t.Fatalf("readiness exposed unexpected error: %q", body)
 	}
 }
@@ -182,7 +183,7 @@ func readyzGet(t *testing.T, node *t4.Node, key, value string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	resp, err := client.Get(ctx, key) // Default etcd GET is linearizable, even in serializable node mode.
