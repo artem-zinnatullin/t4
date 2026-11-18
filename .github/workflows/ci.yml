@@ -322,6 +322,8 @@ jobs:
           echo "Upgrading from: $versions"
           echo "versions=$versions" >> "$GITHUB_OUTPUT"
         env:
+          # Forks test against the same published binaries as upstream.
+          GH_REPO: t4db/t4
           GH_TOKEN: ${{ github.token }}
 
   test-upgrade:
@@ -370,6 +372,7 @@ jobs:
           chmod +x old/t4-linux-amd64
         env:
           FROM: ${{ matrix.from }}
+          GH_REPO: t4db/t4
           GH_TOKEN: ${{ github.token }}
 
       - name: Build t4
