@@ -417,11 +417,17 @@ garbage collector works harder as memory fills instead of letting the container 
 
 | Endpoint | Meaning |
 |---|---|
-| `GET /healthz` | Node has started and is reachable; 503 once it has stopped on its own and must be restarted (`t4 run` also exits) |
-| `GET /readyz` | Node is ready to serve reads |
+| `GET /healthz` | Process liveness, independent of temporary leader outages or follower catch-up; 503 once the node has stopped (`t4 run` also exits) |
+| `GET /readyz` | Completes linearizable read-index synchronization and local apply within 2 seconds; 503 on failure, timeout, or a stopped node |
 | `GET /healthz/leader` | Returns 200 only if this pod is the current leader (useful for proxy routing) |
 
-Configure probes with a longer `initialDelaySeconds` on multi-node deployments to allow checkpoint restore and WAL replay to complete before the pod is declared ready.
+Readiness requires a valid leader lease on the leader, or a reachable current leader and a caught-up local revision on a follower. It uses the existing read-index path without probe writes or object-store requests. Even with `--read-consistency=serializable`, readiness checks this stronger cluster path because the client endpoint also receives writes.
+
+Use `/healthz` for liveness so recovery does not cause restart loops. Allow enough time for checkpoint restore and WAL replay; if using a `startupProbe`, prefer `/healthz` over a strict `/readyz` probe with a short restart budget.
+
+Failed readiness removes the Pod from client Service endpoints after probe detection and endpoint-state propagation. Keep peer discovery reachable independently of client readiness so followers can replicate and re-elect, and preserve `podManagementPolicy: Parallel` for multi-replica bootstrap.
+
+Readiness is a point-in-time signal: a subsequent request can still fail after abrupt leader loss or during endpoint propagation. Clients still need bounded retries; a passing probe does not guarantee transparent I/O failover.
 
 ---
 
