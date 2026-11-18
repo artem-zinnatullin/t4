@@ -110,7 +110,7 @@ type readyzCluster struct {
 	urls  []string
 }
 
-func newReadyzCluster(t *testing.T) readyzCluster {
+func newReadyzCluster(t *testing.T, consistency t4.ReadConsistency) readyzCluster {
 	t.Helper()
 	store := object.NewMem()
 	var c readyzCluster
@@ -119,9 +119,7 @@ func newReadyzCluster(t *testing.T) readyzCluster {
 		node, err := t4.Open(t4.Config{
 			DataDir: t.TempDir(), ObjectStore: store, NodeID: fmt.Sprintf("readyz-%d", i),
 			PeerListenAddr: addr, AdvertisePeerAddr: addr, FollowerMaxRetries: 2,
-			PeerBufferSize: 1000,
-			// Readiness must still prove the stronger path in serializable mode.
-			ReadConsistency: t4.ReadConsistencySerializable,
+			PeerBufferSize: 1000, ReadConsistency: consistency,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -171,6 +169,9 @@ func (c readyzCluster) catchUp(t *testing.T, rev int64, exclude int) {
 
 func readyzGet(t *testing.T, node *t4.Node, key, value string) {
 	t.Helper()
+	if node.ReadConsistency() == t4.ReadConsistencySerializable {
+		t.Fatal("linearizable GET assertion requires a linearizable server")
+	}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +187,7 @@ func readyzGet(t *testing.T, node *t4.Node, key, value string) {
 	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	resp, err := client.Get(ctx, key) // Default etcd GET is linearizable, even in serializable node mode.
+	resp, err := client.Get(ctx, key) // Both client and server use linearizable reads.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,10 +196,10 @@ func readyzGet(t *testing.T, node *t4.Node, key, value string) {
 	}
 }
 
-func TestReadyzFollowerApplyLag(t *testing.T) {
-	// This test owns the global follower hook; it must not run in parallel.
-	c := newReadyzCluster(t)
-	leader := c.leader(t, -1)
+// holdReadyzFollower holds one follower below an acknowledged write. Callers
+// own the global apply hook and must not run in parallel; cleanup releases it.
+func holdReadyzFollower(t *testing.T, c readyzCluster, leader int) (int, int64, func()) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	rev, err := c.nodes[leader].Put(ctx, "/readyz/baseline", []byte("baseline"), 0)
@@ -257,6 +258,14 @@ func TestReadyzFollowerApplyLag(t *testing.T) {
 		t.Fatal("leadership changed or leader did not advance")
 	}
 
+	return blocked, rev, unblock
+}
+
+func TestReadyzFollowerApplyLag(t *testing.T) {
+	c := newReadyzCluster(t, "") // Default server consistency is linearizable.
+	leader := c.leader(t, -1)
+	blocked, rev, unblock := holdReadyzFollower(t, c, leader)
+
 	start := time.Now()
 	readyzStatus(t, c.urls[blocked]+"/readyz", http.StatusServiceUnavailable)
 	elapsed := time.Since(start)
@@ -310,8 +319,22 @@ func TestReadyzFollowerApplyLag(t *testing.T) {
 	}
 }
 
+func TestReadyzSerializableReadiness(t *testing.T) {
+	c := newReadyzCluster(t, t4.ReadConsistencySerializable)
+	leader := c.leader(t, -1)
+	blocked, rev, unblock := holdReadyzFollower(t, c, leader)
+
+	// Serializable reads permit local state, but readiness must still wait for
+	// the leader's read index and local apply before accepting client traffic.
+	readyzStatus(t, c.urls[blocked]+"/readyz", http.StatusServiceUnavailable)
+	readyzStatus(t, c.urls[blocked]+"/healthz", http.StatusOK)
+	c.catchUp(t, rev, blocked)
+	unblock()
+	c.catchUp(t, rev, -1)
+}
+
 func TestReadyzLeaderReplacement(t *testing.T) {
-	c := newReadyzCluster(t)
+	c := newReadyzCluster(t, "")
 	leader := c.leader(t, -1)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
