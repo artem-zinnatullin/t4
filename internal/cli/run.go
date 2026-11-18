@@ -987,6 +987,8 @@ func splitCommaList(v string) []string {
 	return out
 }
 
+const readinessTimeout = 2 * time.Second
+
 func serveMetrics(ctx context.Context, addr string, node *t4.Node, pprofEnabled bool) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
@@ -1012,11 +1014,30 @@ func serveMetrics(ctx context.Context, addr string, node *t4.Node, pprofEnabled 
 		}
 		http.Error(w, "not leader", http.StatusServiceUnavailable)
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if node.CurrentRevision() >= 0 {
-			w.WriteHeader(http.StatusOK)
-		} else {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-node.Done():
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		default:
+		}
+
+		// Readiness always proves the linearizable path, even in serializable
+		// mode: leader lease/read index -> local apply, or one reused peer RPC
+		// -> follower apply. No probe writes or object-store reads are needed.
+		ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
+		defer cancel()
+		if _, err := node.LinearizableRevision(ctx); err != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		// A barrier racing shutdown must not mark a stopped node ready.
+		select {
+		case <-node.Done():
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusOK)
 		}
 	})
 	srv := &http.Server{Addr: addr, Handler: mux}
